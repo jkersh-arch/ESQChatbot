@@ -4,13 +4,12 @@ import requests
 import re
 from typing import List, Dict, Any
 
-
-# Your API key (Note: Keep this secure in production!)
+# API key 
 API_KEY = "6K3XE9j39N7LUjHYmGHSJbYFaQR6UWBk"
 MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
 
 
-# Load the UMD program data
+# UMD program data
 UMD_PROGRAMS_DATA = [
  {
    "url": "https://www.nanocenter.umd.edu/education/nano-minor/",
