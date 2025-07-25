@@ -580,3 +580,111 @@ if __name__ == "__main__":
        share=True,
        debug=True
    )
+# quick_monitor.py - Simple script to quickly check what data has been collected
+import sqlite3
+import json
+from datetime import datetime
+import os
+
+def quick_check():
+    """Quick overview of collected data"""
+    print("🔍 QUICK DATA CHECK")
+    print("=" * 50)
+    
+    # Check if files exist
+    files_to_check = [
+        ('chatbot_interactions.db', 'SQLite Database'),
+        ('chatbot_data.log', 'Text Log File'),
+        ('mistral_api_calls.json', 'API Calls Log')
+    ]
+    
+    print("📁 FILE STATUS:")
+    for filename, description in files_to_check:
+        if os.path.exists(filename):
+            size = os.path.getsize(filename)
+            print(f"   ✅ {description}: {filename} ({size} bytes)")
+        else:
+            print(f"   ❌ {description}: {filename} (not found)")
+    
+    # Check database content
+    try:
+        conn = sqlite3.connect('chatbot_interactions.db')
+        cursor = conn.cursor()
+        
+        # Total interactions
+        cursor.execute("SELECT COUNT(*) FROM user_interactions")
+        total = cursor.fetchone()[0]
+        
+        # Unique sessions  
+        cursor.execute("SELECT COUNT(DISTINCT session_id) FROM user_interactions")
+        sessions = cursor.fetchone()[0]
+        
+        # Most recent interaction
+        cursor.execute("SELECT timestamp, user_message FROM user_interactions ORDER BY timestamp DESC LIMIT 1")
+        recent = cursor.fetchone()
+        
+        print(f"\n📊 DATABASE CONTENT:")
+        print(f"   Total interactions: {total}")
+        print(f"   Unique sessions: {sessions}")
+        if recent:
+            print(f"   Most recent: {recent[0]}")
+            print(f"   Last message: {recent[1][:50]}...")
+        
+        # Get last 5 interactions
+        cursor.execute("SELECT timestamp, user_message, matched_programs FROM user_interactions ORDER BY timestamp DESC LIMIT 5")
+        last_interactions = cursor.fetchall()
+        
+        if last_interactions:
+            print(f"\n💬 LAST 5 USER MESSAGES:")
+            for timestamp, message, programs in last_interactions:
+                print(f"   [{timestamp}] {message}")
+                if programs and programs != "[]":
+                    try:
+                        prog_list = json.loads(programs)
+                        print(f"      → Programs: {', '.join(prog_list)}")
+                    except:
+                        print(f"      → Programs: {programs}")
+        
+        conn.close()
+        
+    except Exception as e:
+        print(f"   ❌ Error reading database: {e}")
+    
+    # Check log file
+    try:
+        with open('chatbot_data.log', 'r') as f:
+            lines = f.readlines()
+        
+        print(f"\n📝 LOG FILE:")
+        print(f"   Total log entries: {len(lines)}")
+        if lines:
+            print(f"   Last entry: {lines[-1].strip()}")
+            
+    except FileNotFoundError:
+        print(f"\n📝 LOG FILE: Not found")
+    except Exception as e:
+        print(f"\n📝 LOG FILE: Error reading - {e}")
+    
+    # Check API calls
+    try:
+        with open('mistral_api_calls.json', 'r') as f:
+            lines = f.readlines()
+        
+        print(f"\n🔗 API CALLS:")
+        print(f"   Total API calls: {len(lines)}")
+        
+        if lines:
+            try:
+                last_call = json.loads(lines[-1])
+                print(f"   Last call: {last_call['timestamp']}")
+            except:
+                print(f"   Last call: Unable to parse")
+                
+    except FileNotFoundError:
+        print(f"\n🔗 API CALLS: No file found")
+    except Exception as e:
+        print(f"\n🔗 API CALLS: Error reading - {e}")
+
+def show_live_count():
+    """Show live count that updates"""
+    import time
