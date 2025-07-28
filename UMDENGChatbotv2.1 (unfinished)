@@ -1,0 +1,443 @@
+import gradio as gr
+import json
+import requests
+import re
+from typing import List, Dict, Any
+import csv
+import os
+from datetime import datetime
+from langchain.embeddings import HuggingFaceEmbeddings
+from langchain.vectorstores import FAISS
+from langchain.document_loaders import PyPDFLoader
+from langchain.text_splitter import CharacterTextSplitter
+import logging
+
+logging.basicConfig(filename='chatbot_secure.log', level=logging.INFO)
+
+def secure_log(message, response):
+    logging.info(f"USER: {remove_pii(message)[:200]} | BOT: {response[:200]}")
+
+# [INTEGRATION 2] --- Limit Model Output ---
+def limit_output(text, max_tokens=300):
+    return ' '.join(text.split()[:max_tokens])
+
+# [INTEGRATION 3] --- Output Safety Filtering ---
+banned_keywords = ["kill", "suicide", "violence", "hack", "terrorist"]
+
+def is_unsafe_output(text):
+    return any(bad_word in text.lower() for bad_word in banned_keywords)
+
+# [INTEGRATION 4] --- Encrypt/Decrypt (Demo Only; Don't use static key in production) ---
+from cryptography.fernet import Fernet
+enc_key = Fernet.generate_key()
+cipher = Fernet(enc_key)
+
+def encrypt_data(data):
+    return cipher.encrypt(data.encode())
+
+def decrypt_data(token):
+    return cipher.decrypt(token).decode()
+
+# [INTEGRATION 5] --- Replace chatbot_response with safer version ---
+def chatbot_response(message, history):
+    context = retrieve_context(message)
+    intent = detect_intent(message)
+
+    system_prompt = prompt_templates[intent]["system"]
+    user_prompt = prompt_templates[intent]["user"](context, message)
+
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "model": "mistral-medium",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        "temperature": 0.7,
+        "max_tokens": 512
+    }
+
+    response = requests.post("https://api.mistral.ai/v1/chat/completions", headers=headers, json=payload)
+
+    if response.status_code == 200:
+        raw_output = response.json()["choices"][0]["message"]["content"].strip()
+        if is_unsafe_output(raw_output):
+            return "⚠️ The response was filtered due to unsafe content."
+        limited_output = limit_output(raw_output)
+        secure_log(message, limited_output)
+        return limited_output
+    else:
+        return f"⚠️ API Error {response.status_code}: {response.text}"
+
+# [INTEGRATION 6] --- Authentication and Authorization ---
+auth_users = [("student1", "password123"), ("advisor", "umdrocks")]
+
+
+# --- 👇 Add PII detection patterns ---
+PII_PATTERNS = {
+    "email": r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",
+    "phone": r"\b(?:\+?1[-.\s]?|0)?(?:\(?\d{3}\)?[-.\s]?)?\d{3}[-.\s]?\d{4}\b",
+    "ssn": r"\b\d{3}-\d{2}-\d{4}\b",
+    "credit_card": r"\b(?:\d[ -]*?){13,16}\b",
+    "zip": r"\b\d{5}(?:-\d{4})?\b"
+}
+
+# --- Step 8: Submission Handler with PII Detection ---
+def detect_pii(text):
+    pii_found = []
+    if re.search(r"\b\d{3}[-.]?\d{2}[-.]?\d{4}\b", text):
+        pii_found.append("SSN")
+    if re.search(r"\b\d{10}\b|\(\d{3}\)[ -]?\d{3}-\d{4}", text):
+        pii_found.append("Phone Number")
+    if re.search(r"[\w.+-]+@[\w-]+\.[\w.-]+", text):
+        pii_found.append("Email")
+    if re.search(r"\b\d{5}(?:-\d{4})?\b", text):
+        pii_found.append("ZIP Code")
+    return pii_found
+
+def remove_pii(text):
+    text = re.sub(r"\b\d{3}[-.]?\d{2}[-.]?\d{4}\b", "[SSN Removed]", text)
+    text = re.sub(r"\b\d{10}\b|\(\d{3}\)[ -]?\d{3}-\d{4}", "[Phone Removed]", text)
+    text = re.sub(r"[\w.+-]+@[\w-]+\.[\w.-]+", "[Email Removed]", text)
+    text = re.sub(r"\b\d{5}(?:-\d{4})?\b", "[ZIP Removed]", text)
+    return text
+
+# --- 👇 Add user profile tracker ---
+user_profile = {
+    "interests": [],
+    "goals": []
+}
+
+# Your API key (Note: Keep this secure in production!)
+API_KEY = "6K3XE9j39N7LUjHYmGHSJbYFaQR6UWBk"
+MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
+VECTOR_DB_PATH = "vector_store"
+PDF_PATH = "/Users/jaydrizzle/Desktop/ESQ/myenv/umd_majors.pdf"
+
+# --- Step 3: Load and Index PDF (one-time run or check if already indexed) ---
+def setup_vector_db():
+    if not os.path.exists(VECTOR_DB_PATH):
+        loader = PyPDFLoader(PDF_PATH)
+        docs = loader.load()
+        splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        chunks = splitter.split_documents(docs)
+        embeddings = HuggingFaceEmbeddings()
+        db = FAISS.from_documents(chunks, embeddings)
+        db.save_local(VECTOR_DB_PATH)
+    else:
+        db = FAISS.load_local(
+            VECTOR_DB_PATH,
+            HuggingFaceEmbeddings(),
+            allow_dangerous_deserialization=True
+        )
+    return db
+
+vector_db = setup_vector_db()
+
+# --- Step 4: Prompt Templates ---
+prompt_templates = {
+    "majors": {
+        "system": "You are an academic advisor at the University of Maryland. Help students choose an engineering major based on their interests and goals.",
+        "user": lambda context, message: f"""Context:\n{context}\n\nStudent's Question:\n{message}\n\nPlease recommend 1–2 relevant engineering majors with short explanations."""
+    },
+    "careers": {
+        "system": "You are a career advisor helping engineering students align their academic path with future career opportunities.",
+        "user": lambda context, message: f"""Context:\n{context}\n\nStudent's Career Question:\n{message}\n\nSuggest career paths and how UMD programs support them."""
+    },
+    "courses": {
+        "system": "You are an academic advisor helping students choose courses based on their intended major and interests.",
+        "user": lambda context, message: f"""Context:\n{context}\n\nStudent's Course Planning Question:\n{message}\n\nRecommend specific courses or course sequences."""
+    }
+}
+
+# --- Step 5: Intent Detection ---
+def detect_intent(message):
+    message = message.lower()
+    if any(word in message for word in ["major", "specialization", "field", "degree"]):
+        return "majors"
+    elif any(word in message for word in ["career", "job", "industry", "internship"]):
+        return "careers"
+    elif any(word in message for word in ["course", "class", "register", "credits"]):
+        return "courses"
+    else:
+        return "majors"  # fallback
+
+# --- Step 6: RAG Function to Get Context ---
+def retrieve_context(query):
+    results = vector_db.similarity_search(query, k=3)
+    return "\n\n".join([doc.page_content for doc in results])
+
+def call_mistral_api(messages: List[Dict[str, str]]) -> str:
+   """
+   Call the Mistral API with conversation messages
+   """
+   headers = {
+       "Authorization": f"Bearer {API_KEY}",
+       "Content-Type": "application/json"
+   }
+  
+   data = {
+       "model": "mistral-medium",
+       "messages": messages,
+       "max_tokens": 1000,
+       "temperature": 0.7
+   }
+  
+   try:
+       response = requests.post(MISTRAL_API_URL, headers=headers, json=data)
+       response.raise_for_status()
+      
+       result = response.json()
+       return result["choices"][0]["message"]["content"]
+      
+   except requests.exceptions.RequestException as e:
+       return f"Sorry, I'm having trouble connecting to my AI service. Please try again later. Error: {str(e)}"
+   except KeyError as e:
+       return f"Sorry, I received an unexpected response. Please try again. Error: {str(e)}"
+
+
+def create_program_summary(program_data: Dict[str, Any]) -> str:
+   """
+   Create a formatted summary of a program
+   """
+   program = program_data["program"]
+  
+   summary = f"**{program['program_name']} ({program['program_type']})**\n\n"
+   summary += f"📋 **Overview:** {program['content'][:200]}...\n\n"
+  
+   if program.get('career_focus'):
+       summary += f"💼 **Career Opportunities:** {', '.join(program['career_focus'])}\n\n"
+  
+   if program.get('industry_applications'):
+       summary += f"🏭 **Industries:** {', '.join(program['industry_applications'])}\n\n"
+  
+   if program.get('specializations') and program['specializations']:
+       summary += f"🎯 **Specializations:** {program['specializations']}\n\n"
+  
+   summary += f"🔗 **More Info:** {program['url']}\n"
+   summary += "---\n"
+  
+   return summary
+
+
+#def chatbot_response(message, history):
+    context = retrieve_context(message)
+    intent = detect_intent(message)
+
+    system_prompt = prompt_templates[intent]["system"]
+    user_prompt = prompt_templates[intent]["user"](context, message)
+
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "model": "mistral-medium",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        "temperature": 0.7,
+        "max_tokens": 512
+    }
+
+    response = requests.post("https://api.mistral.ai/v1/chat/completions", headers=headers, json=payload)
+
+    if response.status_code == 200:
+        return response.json()["choices"][0]["message"]["content"].strip()
+    else:
+        return f"⚠️ API Error {response.status_code}: {response.text}"
+    
+def handle_message_submission(message, history):
+    if message.strip():
+        # Step 1: PII Detection
+        pii_found = detect_pii(message)
+        if pii_found:
+            alert = f"⚠️ Privacy Alert: We detected possible sensitive information in your message ({', '.join(pii_found)}). It has been removed for your safety."
+            message = remove_pii(message)
+            response = alert + "\n\nPlease rephrase your message without personal details.\n"
+        else:
+            # Step 2: Track relevant keywords as interests
+            keywords = message.lower().split()
+            for word in keywords:
+                if word in ['robotics', 'ai', 'materials', 'space', 'bioengineering', 'energy', 'programming']:
+                    if word not in user_profile["interests"]:
+                        user_profile["interests"].append(word)
+
+            # Step 3: Generate response
+            response = chatbot_response(message, history)
+
+        # Step 4: Update interests display
+        interests_text = f"<div style='color:#888; font-size:14px; padding-top:10px;'>🔎 <strong>Tracked Interests:</strong> {', '.join(user_profile['interests']) if user_profile['interests'] else 'None yet'}</div>"
+
+        # Step 5: Return updated chat history
+        updated_history = history + [(message, response)]
+        return updated_history, "", interests_text
+
+    return history, "", f"<div style='color:#888; font-size:14px; padding-top:10px;'>🔎 <strong>Tracked Interests:</strong> {', '.join(user_profile['interests']) if user_profile['interests'] else 'None yet'}</div>"
+
+# Now connect this handler to your Gradio interface's submit button
+
+def on_submit(message, history):
+    updated_history, _, interests_text = handle_message_submission(message, history)
+    return updated_history, interests_text
+
+def get_chat_history(history):
+    return "\n\n".join([f"👤 {user}\n🤖 {bot}" for user, bot in history])
+
+def save_history_to_file(history):
+    with open("chat_history.txt", "w") as f:
+        for user, bot in history:
+            f.write(f"User: {user}\nBot: {bot}\n\n")
+    return "✅ Chat history saved to chat_history.txt"
+
+def create_interface():
+    """
+    Create and configure the Gradio interface
+    """
+    css = """
+    .gradio-container {
+        max-width: 800px !important;
+        margin: auto !important;
+    }
+    .chat-message {
+        padding: 10px !important;
+        margin: 5px 0 !important;
+    }
+    .title {
+        text-align: center;
+        color: #d73027;
+        font-weight: bold;
+    }
+    .subtitle {
+        text-align: center;
+        color: #666;
+        font-style: italic;
+    }
+    """
+
+    with gr.Blocks(css=css, title="UMD Engineering Advisor") as interface:
+        gr.HTML("""
+            <div style="text-align: center; padding: 20px;">
+                <h1 style="color: #d73027; margin-bottom: 10px;">🎓 UMD Engineering Academic Advisor</h1>
+                <h3 style="color: #666; font-weight: normal;">A. James Clark School of Engineering</h3>
+                <p style="color: #888; font-size: 16px;">
+                    Get personalized recommendations for engineering majors and minors based on your interests!
+                </p>
+            </div>
+        """)
+
+        # Add this as a component that can be updated
+        interests_display = gr.HTML(value="<div style='color:#888; font-size:14px; padding-top:10px;'>🔎 <strong>Tracked Interests:</strong> None yet</div>")
+
+        chatbot = gr.Chatbot(
+            height=500,
+            show_label=False,
+            avatar_images=["🧑‍🎓", "🤖"],
+            bubble_full_width=False
+        )
+
+        with gr.Row():
+            msg = gr.Textbox(
+                placeholder="Tell me about your interests! (e.g., 'I like building robots and programming' or 'I'm interested in sustainable energy')",
+                show_label=False,
+                container=False,
+                scale=4
+            )
+            submit_btn = gr.Button("Send", variant="primary", scale=1)
+
+        with gr.Row():
+            clear_btn = gr.Button("Clear Chat", variant="secondary")
+
+        # 🧠 Add chat history output
+        history_output = gr.Textbox(label="Full Chat History", lines=10, interactive=False)
+
+        with gr.Row():
+            view_btn = gr.Button("🔍 View Chat History")
+            save_btn = gr.Button("💾 Save Chat to File")
+
+        # 💬 Click actions
+        submit_btn.click(handle_message_submission, inputs=[msg, chatbot], outputs=[chatbot, msg, interests_display])
+        msg.submit(handle_message_submission, inputs=[msg, chatbot], outputs=[chatbot, msg, interests_display])
+        clear_btn.click(lambda: ([], ""), outputs=[chatbot, msg])
+        view_btn.click(get_chat_history, inputs=[chatbot], outputs=[history_output])
+        save_btn.click(save_history_to_file, inputs=[chatbot], outputs=[history_output])
+
+        # ✅ Fixed HTML (no Python code inside!)
+        gr.HTML("""
+            <div style="text-align: center; padding: 20px; color: #888; font-size: 14px;">
+                <p>💡 <strong>Tips for better recommendations:</strong></p>
+                <ul style="text-align: left; display: inline-block;">
+                    <li>Mention specific technologies, fields, or activities you enjoy</li>
+                    <li>Tell me about your career goals or dream job</li>
+                    <li>Ask about specific programs or compare different options</li>
+                    <li>Mention if you prefer hands-on work, research, or design</li>
+                </ul>
+                <p style="margin-top: 15px;">
+                    <em>This chatbot uses AI to provide academic guidance. Always verify information with official UMD sources.</em>
+                </p>
+            </div>
+        """)
+
+        # Add feedback section
+        with gr.Accordion("📝 Give Feedback on Last Response", open=False):
+            with gr.Row():
+                rating = gr.Radio(
+                    choices=["👍 Helpful", "👎 Not Helpful", "🤔 Partially Helpful"], 
+                    label="How was the response?",
+                    value=None
+         )
+            feedback_text = gr.Textbox(
+                label="Additional feedback (optional)", 
+                placeholder="Tell us what could be improved...",
+                lines=3
+        )
+            feedback_submit = gr.Button("Submit Feedback", variant="secondary")
+            feedback_status = gr.Textbox(label="Status", interactive=False, visible=False)
+
+    return interface
+
+def save_feedback(user_message, bot_response, rating, feedback_text, history):
+    """Save feedback to CSV file"""
+    feedback_data = {
+        'timestamp': datetime.now().isoformat(),
+        'user_message': user_message,
+        'bot_response': bot_response[:200] + "..." if len(bot_response) > 200 else bot_response,
+        'rating': rating,
+        'feedback_text': feedback_text,
+        'tracked_interests': ', '.join(user_profile['interests'])
+    }
+    
+    # Create CSV file if it doesn't exist
+    csv_file = 'chatbot_feedback.csv'
+    file_exists = os.path.isfile(csv_file)
+    
+    with open(csv_file, 'a', newline='', encoding='utf-8') as file:
+        fieldnames = ['timestamp', 'user_message', 'bot_response', 'rating', 'feedback_text', 'tracked_interests']
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        
+        if not file_exists:
+            writer.writeheader()
+        
+        writer.writerow(feedback_data)
+    
+    return "✅ Thank you! Your feedback has been saved.", "", ""
+
+
+# Launch the application 
+if __name__ == "__main__":
+   interface = create_interface()
+   interface.launch(
+    server_name="0.0.0.0",
+    server_port=7863,
+    share=True,
+    debug=True,
+    auth=[("student1", "password123"), ("advisor", "umdrocks")]
+)
+
+   )
