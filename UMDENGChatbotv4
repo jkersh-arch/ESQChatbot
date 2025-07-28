@@ -1,0 +1,807 @@
+def detect_intent(message):
+    message = message.lower()
+    if any(word in message for word in ["major", "specialization", "field", "degree", "program"]):
+        return "majors"
+    elif any(word in message for word in ["career", "job", "industry", "internship", "work", "salary", "employment"]):
+        return "careers"
+    elif any(word in message for word in ["course", "class", "register", "credits", "semester", "professor"]):
+        return "courses"
+    else:
+        return "general" 
+import gradio as gr
+import json
+import requests
+import re
+from typing import List, Dict, Any
+import csv
+import os
+from datetime import datetime
+from langchain.embeddings import HuggingFaceEmbeddings
+from langchain.vectorstores import FAISS
+from langchain.document_loaders import PyPDFLoader
+from langchain.text_splitter import CharacterTextSplitter
+import logging
+
+logging.basicConfig(filename='chatbot_secure.log', level=logging.INFO)
+
+def secure_log(message, response):
+    logging.info(f"USER: {remove_pii(message)[:200]} | BOT: {response[:200]}")
+
+# [INTEGRATION 2] --- Limit Model Output ---
+def limit_output(text, max_tokens=300):
+    return ' '.join(text.split()[:max_tokens])
+
+# [INTEGRATION 3] --- Output Safety Filtering ---
+banned_keywords = ["kill", "suicide", "violence", "hack", "terrorist"]
+
+def is_unsafe_output(text):
+    return any(bad_word in text.lower() for bad_word in banned_keywords)
+
+# [INTEGRATION 4] --- Encrypt/Decrypt (Demo Only; Don't use static key in production) ---
+from cryptography.fernet import Fernet
+enc_key = Fernet.generate_key()
+cipher = Fernet(enc_key)
+
+def encrypt_data(data):
+    return cipher.encrypt(data.encode())
+
+def decrypt_data(token):
+    return cipher.decrypt(token).decode()
+
+# Authentication and Authorization
+auth_users = [("student1", "password123"), ("advisor", "umdrocks")]
+
+# --- PII detection patterns ---
+PII_PATTERNS = {
+    "email": r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",
+    "phone": r"\b(?:\+?1[-.\s]?|0)?(?:\(?\d{3}\)?[-.\s]?)?\d{3}[-.\s]?\d{4}\b",
+    "ssn": r"\b\d{3}-\d{2}-\d{4}\b",
+    "credit_card": r"\b(?:\d[ -]*?){13,16}\b",
+    "zip": r"\b\d{5}(?:-\d{4})?\b"
+}
+
+def detect_pii(text):
+    pii_found = []
+    if re.search(r"\b\d{3}[-.]?\d{2}[-.]?\d{4}\b", text):
+        pii_found.append("SSN")
+    if re.search(r"\b\d{10}\b|\(\d{3}\)[ -]?\d{3}-\d{4}", text):
+        pii_found.append("Phone Number")
+    if re.search(r"[\w.+-]+@[\w-]+\.[\w.-]+", text):
+        pii_found.append("Email")
+    if re.search(r"\b\d{5}(?:-\d{4})?\b", text):
+        pii_found.append("ZIP Code")
+    return pii_found
+
+def remove_pii(text):
+    text = re.sub(r"\b\d{3}[-.]?\d{2}[-.]?\d{4}\b", "[SSN Removed]", text)
+    text = re.sub(r"\b\d{10}\b|\(\d{3}\)[ -]?\d{3}-\d{4}", "[Phone Removed]", text)
+    text = re.sub(r"[\w.+-]+@[\w-]+\.[\w.-]+", "[Email Removed]", text)
+    text = re.sub(r"\b\d{5}(?:-\d{4})?\b", "[ZIP Removed]", text)
+    return text
+
+# User profile tracker
+user_profile = {
+    "interests": [],
+    "goals": [],
+    "majors_discussed": []
+}
+
+# Your API key (Note: Keep this secure in production!)
+API_KEY = "6K3XE9j39N7LUjHYmGHSJbYFaQR6UWBk"
+MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
+VECTOR_DB_PATH = "vector_store"
+PDF_PATH = "/Users/jaydrizzle/Desktop/ESQ/myenv/umd_majors.pdf"
+
+# Setup vector database
+def setup_vector_db():
+    if not os.path.exists(VECTOR_DB_PATH):
+        loader = PyPDFLoader(PDF_PATH)
+        docs = loader.load()
+        splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        chunks = splitter.split_documents(docs)
+        embeddings = HuggingFaceEmbeddings()
+        db = FAISS.from_documents(chunks, embeddings)
+        db.save_local(VECTOR_DB_PATH)
+    else:
+        db = FAISS.load_local(
+            VECTOR_DB_PATH,
+            HuggingFaceEmbeddings(),
+            allow_dangerous_deserialization=True
+        )
+    return db
+
+vector_db = setup_vector_db()
+
+# Enhanced prompt templates with UMD personality and readable formatting
+prompt_templates = {
+    "majors": {
+        "system": """You are Terry, a friendly and knowledgeable academic advisor at the University of Maryland's A. James Clark School of Engineering. You're passionate about helping students find their perfect engineering path and you know all about UMD's amazing programs. 
+
+CRITICAL FORMATTING REQUIREMENTS - YOU MUST FOLLOW THESE:
+1. ALWAYS start responses with a clear emoji heading like "🎯 **Great Question About [Topic]!**"
+2. NEVER write long paragraphs - maximum 2-3 sentences per paragraph
+3. ALWAYS use bullet points (•) for lists of information
+4. ALWAYS use clear section headers with emojis (📚, 💼, 🔬, etc.)
+5. ALWAYS add line breaks between different sections
+6. ALWAYS end with a follow-up question
+
+EXAMPLE RESPONSE FORMAT:
+🎯 **Great Question About Computer Engineering!**
+
+💻 **What is Computer Engineering?**
+Computer Engineering combines electrical engineering with computer science. Students learn both hardware and software design. It's perfect for people who love both coding and understanding how computers work.
+
+💼 **Career Opportunities:**
+• Software Engineer: $85k-120k starting salary
+• Hardware Engineer: $75k-110k starting salary  
+• Systems Architect: $90k-130k starting salary
+• Embedded Systems Developer: $80k-115k starting salary
+
+📚 **Key UMD Courses:**
+• CMSC131/132: Programming fundamentals
+• ENEE244: Digital logic design
+• CMSC411: Computer systems architecture
+
+💡 **What interests you most - the hardware side or software side of computing?**
+
+You should:
+- Be enthusiastic and encouraging about UMD engineering
+- Use a conversational, supportive tone
+- Reference UMD-specific opportunities when relevant
+- Ask follow-up questions to better understand student interests""",
+        "user": lambda context, message: f"""Context from UMD Engineering materials:\n{context}\n\nStudent's Question:\n{message}\n\nAs Terry the UMD advisor, provide a well-formatted, easy-to-read response using the EXACT format shown in your system prompt. Use clear headings, bullet points, short paragraphs, and ask a follow-up question."""
+    },
+    "careers": {
+        "system": """You are Terry, a career-focused academic advisor at UMD's Clark School of Engineering. You understand how UMD's programs connect to amazing career opportunities and you love sharing success stories.
+
+CRITICAL FORMATTING REQUIREMENTS - YOU MUST FOLLOW THESE:
+1. ALWAYS start with an emoji heading like "💼 **Career Opportunities in [Field]!**"
+2. NEVER write long paragraphs - maximum 2-3 sentences per paragraph
+3. ALWAYS use bullet points (•) for job titles, salaries, companies
+4. ALWAYS use clear section headers with emojis (🏢, 💰, 🚀, 📈, etc.)
+5. ALWAYS add line breaks between sections
+6. ALWAYS end with a follow-up question
+
+EXAMPLE RESPONSE FORMAT:
+💼 **Career Opportunities in Mechanical Engineering!**
+
+🏢 **Industries You Can Work In:**
+• Automotive (Ford, GM, Tesla)
+• Aerospace (Boeing, Lockheed Martin, NASA)
+• Manufacturing (General Electric, Caterpillar)
+• Energy (ExxonMobil, renewable energy companies)
+
+💰 **Expected Salaries:**
+• Entry Level: $65k-75k
+• Mid-Career: $85k-110k
+• Senior Level: $120k+
+
+🚀 **What UMD Grads Are Doing:**
+• Design engineers at major automotive companies
+• Research positions at NASA Goddard
+• Product development at tech startups
+
+💡 **Which industry excites you most?**
+
+Focus on:
+- Real career paths and job prospects
+- UMD's strong industry connections
+- Specific companies that recruit from UMD""",
+        "user": lambda context, message: f"""Context:\n{context}\n\nStudent's Career Question:\n{message}\n\nAs Terry, explain career opportunities using the EXACT formatting shown in your system prompt. Use clear headers, bullet points, short paragraphs, and ask a follow-up question."""
+    },
+    "courses": {
+        "system": """You are Terry, an experienced academic advisor who knows UMD's engineering curriculum inside and out. You help students plan their academic journey strategically.
+
+CRITICAL FORMATTING REQUIREMENTS - YOU MUST FOLLOW THESE:
+1. ALWAYS start with an emoji heading like "📚 **Course Planning for [Topic]!**"
+2. NEVER write long paragraphs - maximum 2-3 sentences per paragraph
+3. ALWAYS use bullet points (•) for course lists and requirements
+4. ALWAYS use clear section headers with emojis (📖, ⭐, 📅, ⚠️, etc.)
+5. ALWAYS add line breaks between sections
+6. ALWAYS end with a follow-up question
+
+EXAMPLE RESPONSE FORMAT:
+📚 **Course Planning for Aerospace Engineering!**
+
+📖 **Core Courses You'll Take:**
+• ENES102: Statics and Mechanics
+• MATH241: Calculus III
+• PHYS261: Physics for Engineers
+• AERO220: Aerodynamics Fundamentals
+
+⭐ **Difficulty Level:**
+• ENES102: Moderate - requires good math skills
+• AERO220: Challenging - lots of problem-solving
+• MATH241: High - builds on previous calculus
+
+📅 **Recommended Schedule:**
+• Freshman: Focus on math and physics foundation
+• Sophomore: Begin core engineering courses
+• Junior/Senior: Specialization and electives
+
+💡 **Are you more interested in aircraft design or space systems?**
+
+Provide guidance on:
+- Course sequences and prerequisites
+- Difficulty levels and study tips
+- How courses connect to career goals""",
+        "user": lambda context, message: f"""Context:\n{context}\n\nStudent's Course Question:\n{message}\n\nAs Terry, provide course guidance using the EXACT formatting shown in your system prompt. Use clear headers, bullet points, short paragraphs, and ask a follow-up question."""
+    },
+    "general": {
+        "system": """You are Terry, a warm and welcoming advisor at UMD's Clark School of Engineering. When students ask general questions or just want to chat, you're here to help them feel comfortable and guide them toward their engineering journey.
+
+CRITICAL FORMATTING REQUIREMENTS - YOU MUST FOLLOW THESE:
+1. ALWAYS start with an emoji heading like "👋 **Welcome to UMD Engineering!**"
+2. NEVER write long paragraphs - maximum 2-3 sentences per paragraph
+3. ALWAYS use bullet points (•) for options and suggestions
+4. ALWAYS use clear section headers with emojis (🎓, 🌟, 🔍, etc.)
+5. ALWAYS add line breaks between sections
+6. ALWAYS end with a follow-up question
+
+EXAMPLE RESPONSE FORMAT:
+👋 **Welcome to UMD Engineering!**
+
+🎓 **I'm Here to Help You:**
+Engineering is an amazing field with so many possibilities! At UMD, we have 14 different engineering programs to choose from.
+
+🔍 **Ways I Can Assist:**
+• Help you discover which major fits your interests
+• Explain career opportunities and job prospects
+• Guide you through course planning and requirements
+• Share info about research and internship opportunities
+
+🌟 **Getting Started:**
+• Tell me what you enjoy doing in your free time
+• Share what subjects you excel in or find interesting
+• Mention any career goals or dreams you have
+
+💡 **What would you like to explore first - your interests, career goals, or specific engineering programs?**
+
+Be:
+- Welcoming and encouraging
+- Ready to explore their interests
+- Supportive of their academic journey""",
+        "user": lambda context, message: f"""Context:\n{context}\n\nStudent says:\n{message}\n\nRespond as Terry using the EXACT formatting shown in your system prompt. Use clear headers, bullet points, short paragraphs, and ask a follow-up question to guide the conversation."""
+    }
+}
+
+# Enhanced intent detection
+def update_journey_stage(profile):
+    """Update the user's journey stage based on collected information"""
+    interactions = profile['interaction_count']
+    interests_count = len(profile['interests'])
+    goals_count = len(profile['goals'])
+    traits_count = len(profile['personality_traits'])
+    
+    total_info = interests_count + goals_count + traits_count
+    
+    if interactions <= 2 and total_info <= 2:
+        profile['journey_stage'] = "getting_to_know"
+    elif interactions <= 4 and total_info <= 4:
+        profile['journey_stage'] = "exploring_options"
+    elif total_info >= 3 and interactions >= 3:
+        profile['journey_stage'] = "narrowing_down"
+    elif total_info >= 5 or interactions >= 6:
+        profile['journey_stage'] = "ready_for_recommendation"
+    
+    return profile['journey_stage']
+
+def extract_profile_info(message):
+    """Extract interests, goals, and personality traits from user message"""
+    message_lower = message.lower()
+    
+    # Technical interests
+    tech_interests = ['robotics', 'ai', 'artificial intelligence', 'programming', 'coding', 'software', 
+                     'hardware', 'circuits', 'electronics', 'data', 'machine learning', 'cybersecurity',
+                     'web development', 'mobile apps', 'gaming', 'automation']
+    
+    # Engineering fields
+    engineering_interests = ['mechanical', 'electrical', 'civil', 'chemical', 'aerospace', 'biomedical',
+                           'environmental', 'materials', 'nuclear', 'computer', 'systems', 'industrial']
+    
+    # Personality traits
+    hands_on_words = ['build', 'make', 'create', 'hands-on', 'practical', 'tinker', 'construct']
+    analytical_words = ['analyze', 'solve', 'math', 'mathematical', 'logical', 'problem-solving']
+    creative_words = ['design', 'creative', 'innovative', 'artistic', 'aesthetic', 'visual']
+    research_words = ['research', 'discover', 'investigate', 'study', 'academic', 'theoretical']
+    
+    # Career goals
+    career_words = ['job', 'career', 'work', 'industry', 'company', 'startup', 'entrepreneur']
+    
+    found_interests = []
+    found_traits = []
+    found_goals = []
+    
+    # Check for interests
+    for interest in tech_interests + engineering_interests:
+        if interest in message_lower and interest not in user_profile['interests']:
+            found_interests.append(interest)
+    
+    # Check for traits
+    if any(word in message_lower for word in hands_on_words):
+        found_traits.append('hands_on')
+    if any(word in message_lower for word in analytical_words):
+        found_traits.append('analytical')
+    if any(word in message_lower for word in creative_words):
+        found_traits.append('creative')
+    if any(word in message_lower for word in research_words):
+        found_traits.append('research_oriented')
+    
+    # Check for career mentions
+    if any(word in message_lower for word in career_words):
+        found_goals.append('career_focused')
+    
+    return found_interests, found_traits, found_goals
+    message = message.lower()
+    if any(word in message for word in ["major", "specialization", "field", "degree", "program"]):
+        return "majors"
+    elif any(word in message for word in ["career", "job", "industry", "internship", "work", "salary", "employment"]):
+        return "careers"
+    elif any(word in message for word in ["course", "class", "register", "credits", "semester", "professor"]):
+        return "courses"
+    else:
+        return "general"
+
+def retrieve_context(query):
+    results = vector_db.similarity_search(query, k=3)
+    return "\n\n".join([doc.page_content for doc in results])
+
+def chatbot_response(message, history):
+    print("Getting context...")
+    context = retrieve_context(message)
+    intent = detect_intent(message)
+    print("Intent:", intent)
+
+    system_prompt = prompt_templates[intent]["system"]
+    user_prompt = prompt_templates[intent]["user"](context, message)
+
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "model": "mistral-medium",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        "temperature": 0.7,
+        "max_tokens": 512
+    }
+
+    try:
+        response = requests.post(MISTRAL_API_URL, headers=headers, json=payload)
+        print("API response:", response.status_code, response.text)
+
+        if response.status_code == 200:
+            raw_output = response.json()["choices"][0]["message"]["content"].strip()
+            return raw_output   # <-- ADD THIS LINE
+        else:
+            return f"🤖 Error: {response.status_code} - {response.text}"
+    except Exception as e:
+        print("Exception:", e)
+        return "🤖 Oops! I'm experiencing some connectivity issues. Please try your question again!"
+def get_welcome_message():
+    return """👋 **Hi there! I'm Terry, your friendly UMD Engineering advisor!**
+
+🎓 **Welcome to the A. James Clark School of Engineering!**
+
+I'm here to help you explore our amazing engineering programs and find your perfect path.
+
+---
+
+🎯 **What I can help you with:**
+• 🔍 **Find your ideal major** - Based on your interests and career goals
+• 💼 **Explore career paths** - Job prospects, salaries, and industry connections  
+• 📚 **Plan your courses** - Course sequences, prerequisites, and study tips
+• 🔬 **Discover research** - Labs, faculty, and undergraduate opportunities
+• 🏢 **Learn about student life** - Organizations, internships, and campus resources
+
+---
+
+💬 **Getting started is easy!**
+
+Just tell me what you're curious about, or share your interests and I'll help guide you toward the right path!
+
+*Examples you can try:*
+• "I love coding and want to build apps"
+• "What can I do with a mechanical engineering degree?"
+• "I'm interested in renewable energy and sustainability"
+
+🐢 **Go Terps!** 🔴⚪
+
+*What would you like to explore first?*"""
+
+def handle_message_submission(message, history):
+    if message.strip():
+        # Initialize with welcome message if this is the first interaction
+        if not history:
+            history = [("", get_welcome_message())]
+        
+        # PII Detection
+        pii_found = detect_pii(message)
+        if pii_found:
+            alert = f"🔒 Privacy Alert: I noticed you might have included personal information ({', '.join(pii_found)}). For your safety, I've removed it. Please rephrase your message without personal details."
+            message = remove_pii(message)
+            response = alert
+        else:
+            # Extract and update profile information
+            found_interests, found_traits, found_goals = extract_profile_info(message)
+            # Update user profile
+            for interest in found_interests:
+                if interest not in user_profile["interests"]:
+                    user_profile["interests"].append(interest)
+# ...existing code...
+                else:
+                    found_interests, found_traits, found_goals = extract_profile_info(message)
+            # Update user profile
+            for interest in found_interests:
+                if interest not in user_profile["interests"]:
+                    user_profile["interests"].append(interest)
+# ...existing code...
+            # Generate response
+            response = chatbot_response(message, history)
+
+        # Update interests display
+        if user_profile["interests"]:
+            interests_text = f"""
+            <div style='background: linear-gradient(90deg, #DC143C, #FFD700); padding: 12px; border-radius: 8px; margin: 10px 0;'>
+                <div style='color: white; font-weight: bold; margin-bottom: 5px;'>🎯 Your Engineering Interests:</div>
+                <div style='color: white; font-size: 14px;'>{', '.join(user_profile['interests'])}</div>
+            </div>
+            """
+        else:
+            interests_text = """
+            <div style='background: #f8f9fa; padding: 12px; border-radius: 8px; margin: 10px 0; border-left: 4px solid #DC143C;'>
+                <div style='color: #666; font-size: 14px;'>💡 Tell me about your interests and I'll track them to give you better recommendations!</div>
+            </div>
+            """
+
+        # Return updated chat history
+        updated_history = history + [(message, response)]
+        return updated_history, "", interests_text
+
+    return history, "", """
+    <div style='background: #f8f9fa; padding: 12px; border-radius: 8px; margin: 10px 0; border-left: 4px solid #DC143C;'>
+        <div style='color: #666; font-size: 14px;'>💡 Tell me about your interests and I'll track them to give you better recommendations!</div>
+    </div>
+    """
+
+def get_chat_history(history):
+    return "\n\n".join([f"👤 Student: {user}\n🤖 Terry: {bot}" for user, bot in history if user])
+
+def save_history_to_file(history):
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"umd_chat_history_{timestamp}.txt"
+    with open(filename, "w") as f:
+        f.write("=== UMD Engineering Advisor Chat History ===\n")
+        f.write(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Tracked Interests: {', '.join(user_profile['interests'])}\n")
+        f.write("=" * 50 + "\n\n")
+        for user, bot in history:
+            if user:  # Skip empty user messages
+                f.write(f"Student: {user}\n")
+                f.write(f"Terry: {bot}\n\n")
+    return f"✅ Chat history saved to {filename}"
+
+def save_feedback(rating, feedback_text, history):
+    """Save feedback to CSV file"""
+    if not history:
+        return "❌ No chat history to provide feedback on.", "", ""
+    
+    last_interaction = history[-1] if history else ("", "")
+    user_message = last_interaction[0] if len(last_interaction) > 0 else ""
+    bot_response = last_interaction[1] if len(last_interaction) > 1 else ""
+    
+    feedback_data = {
+        'timestamp': datetime.now().isoformat(),
+        'user_message': user_message[:200] + "..." if len(user_message) > 200 else user_message,
+        'bot_response': bot_response[:200] + "..." if len(bot_response) > 200 else bot_response,
+        'rating': rating,
+        'feedback_text': feedback_text,
+        'tracked_interests': ', '.join(user_profile['interests'])
+    }
+    
+    csv_file = 'umd_chatbot_feedback.csv'
+    file_exists = os.path.isfile(csv_file)
+    
+    with open(csv_file, 'a', newline='', encoding='utf-8') as file:
+        fieldnames = ['timestamp', 'user_message', 'bot_response', 'rating', 'feedback_text', 'tracked_interests']
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        
+        if not file_exists:
+            writer.writeheader()
+        
+        writer.writerow(feedback_data)
+    
+    return "✅ Thank you for your feedback! This helps me improve.", "", ""
+
+#def handle_feedback(message, response, feedback):
+    #with open("feedback_log.csv", "a") as f:
+       # f.write(f"{datetime.now()},{message},{response},{feedback}\n")
+   # return "Thanks for your feedback!"
+
+#interface = gr.ChatInterface(
+   # fn=handle_message_submission,
+   # title="Terry - Engineering Major Mentor",
+   # chatbot=gr.Chatbot(height=400),
+   # textbox=gr.Textbox(placeholder="What's on your mind?", container=False, scale=7),
+   # description="Talk to Terry about your goals, interests, and personality.",
+   # theme="soft",
+   # examples=["I like math and robotics.", "I'm curious about biology and people.", "What can I do with a computer engineering degree?"],
+   # cache_examples=False,
+   # retry_btn=None,
+   # undo_btn="Delete Previous",
+   # clear_btn="Clear",
+   # feedback_fn=handle_feedback  # ← Add this line
+)
+
+
+def create_interface():
+    """Create and configure the enhanced Gradio interface"""
+    
+    # Enhanced UMD-themed CSS
+    css = """
+    .gradio-container {
+        max-width: 1000px !important;
+        margin: auto !important;
+        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    }
+    
+    .chat-message {
+        padding: 15px !important;
+        margin: 8px 0 !important;
+        border-radius: 12px !important;
+    }
+    
+    .header-section {
+        background: linear-gradient(135deg, #DC143C 0%, #8B0000 100%);
+        color: white;
+        padding: 30px;
+        border-radius: 15px;
+        margin-bottom: 20px;
+        text-align: center;
+        box-shadow: 0 4px 15px rgba(220, 20, 60, 0.3);
+    }
+    
+    .quick-start-section {
+        background: #f8f9fa;
+        border: 2px solid #DC143C;
+        border-radius: 12px;
+        padding: 20px;
+        margin: 15px 0;
+    }
+    
+    .stats-section {
+        background: linear-gradient(45deg, #FFD700, #FFA500);
+        color: #333;
+        padding: 15px;
+        border-radius: 10px;
+        margin: 10px 0;
+        font-weight: bold;
+        text-align: center;
+    }
+    
+    button {
+        border-radius: 8px !important;
+        font-weight: 500 !important;
+        transition: all 0.3s ease !important;
+    }
+    
+    .primary-btn {
+        background: linear-gradient(45deg, #DC143C, #B22222) !important;
+        border: none !important;
+        color: white !important;
+    }
+    
+    .secondary-btn {
+        background: linear-gradient(45deg, #FFD700, #FFA500) !important;
+        border: none !important;
+        color: #333 !important;
+    }
+    
+    .textbox {
+        border-radius: 10px !important;
+        border: 2px solid #ddd !important;
+    }
+    
+    .textbox:focus {
+        border-color: #DC143C !important;
+        box-shadow: 0 0 10px rgba(220, 20, 60, 0.2) !important;
+    }
+    """
+
+    with gr.Blocks(css=css, title="🐢 UMD Engineering Advisor - Terry") as interface:
+        
+        # Enhanced Header
+        gr.HTML("""
+            <div class="header-section">
+                <h1 style="font-size: 2.5em; margin: 0; text-shadow: 2px 2px 4px rgba(0,0,0,0.3);">
+                    🐢 Terry - Your UMD Engineering Advisor
+                </h1>
+                <h2 style="font-size: 1.3em; margin: 10px 0; opacity: 0.9;">
+                    A. James Clark School of Engineering
+                </h2>
+                <p style="font-size: 1.1em; margin: 15px 0 0 0; line-height: 1.4;">
+                    🎓 Discover your perfect engineering path at Maryland! 🎓<br>
+                    <em>Fear the Turtle, Engineer the Future</em>
+                </p>
+            </div>
+        """)
+
+        # Quick Start Guide
+        with gr.Row():
+            with gr.Column(scale=2):
+                gr.HTML("""
+                    <div class="quick-start-section">
+                        <h3 style="color: #DC143C; margin-top: 0;">🚀 Quick Start Guide</h3>
+                        <div style="text-align: left; color: #333;">
+                            <p style="color: #333;"><strong>👋 New to UMD Engineering?</strong> Try asking:</p>
+                            <ul style="margin: 10px 0; color: #333;">
+                                <li>"I love building things and coding - what majors should I consider?"</li>
+                                <li>"What can I do with a computer engineering degree?"</li>
+                                <li>"Tell me about research opportunities for freshmen"</li>
+                                <li>"What's the difference between CS and CE at UMD?"</li>
+                            </ul>
+                            <p style="color: #333;"><strong>💡 Pro tip:</strong> The more you tell me about your interests, the better recommendations I can give!</p>
+                        </div>
+                    </div>
+                """)
+            
+            with gr.Column(scale=1):
+                gr.HTML("""
+                    <div class="stats-section">
+                        <h4 style="margin-top: 0;">📊 UMD Engineering Facts</h4>
+                        <p style="margin: 8px 0;">🏆 #1 Public Engineering in Region</p>
+                        <p style="margin: 8px 0;">🔬 14 Engineering Programs</p>
+                        <p style="margin: 8px 0;">🌟 95% Job Placement Rate</p>
+                        <p style="margin: 8px 0;">💼 $75k+ Average Starting Salary</p>
+                    </div>
+                """)
+
+        # Interest tracking display
+        interests_display = gr.HTML(value="""
+            <div style='background: #f8f9fa; padding: 12px; border-radius: 8px; margin: 10px 0; border-left: 4px solid #DC143C;'>
+                <div style='color: #666; font-size: 14px;'>💡 Tell me about your interests and I'll track them to give you better recommendations!</div>
+            </div>
+        """)
+
+        # Main chat interface
+        chatbot = gr.Chatbot(
+            height=500,
+            show_label=False,
+            avatar_images=["🧑‍🎓", "🐢"],
+            bubble_full_width=False,
+            show_copy_button=True,
+            value=[(None, get_welcome_message())]
+        )
+
+        # Input section with enhanced styling
+        with gr.Row():
+            msg = gr.Textbox(
+                placeholder="💬 Ask me anything about UMD Engineering! (e.g., 'I'm interested in AI and robotics' or 'What courses should I take for aerospace?')",
+                show_label=False,
+                container=False,
+                scale=5,
+                lines=2
+            )
+            with gr.Column(scale=1):
+                submit_btn = gr.Button("Send 🚀", variant="primary", size="lg")
+                clear_btn = gr.Button("New Chat 🔄", variant="secondary")
+
+        # Action buttons
+        with gr.Row():
+            with gr.Column():
+                view_btn = gr.Button("📋 View Full Conversation", variant="secondary")
+                save_btn = gr.Button("💾 Download Chat History", variant="secondary")
+            with gr.Column():
+                gr.HTML("""
+                    <div style="text-align: center; padding: 10px;">
+                        <p style="color: #666; font-size: 14px; margin: 0;">
+                            Need human help? Visit <a href="https://eng.umd.edu/advising" target="_blank" style="color: #DC143C;">UMD Engineering Advising</a>
+                        </p>
+                    </div>
+                """)
+
+        # Chat history output
+        with gr.Accordion("📜 Full Conversation History", open=False):
+            history_output = gr.Textbox(label="Complete Chat Log", lines=10, interactive=False, show_copy_button=True)
+
+        # Enhanced feedback section
+        with gr.Accordion("📝 Help Terry Improve!", open=False):
+            gr.HTML("""
+                <div style="background: linear-gradient(90deg, #FFD700, #FFA500); padding: 15px; border-radius: 8px; margin-bottom: 15px;">
+                    <h4 style="margin: 0; color: #333;">🌟 Your feedback makes Terry better!</h4>
+                    <p style="margin: 5px 0 0 0; color: #555;">Rate the last response and help improve the UMD Engineering advising experience.</p>
+                </div>
+            """)
+            
+            with gr.Row():
+                rating = gr.Radio(
+                    choices=["🌟 Excellent - Very helpful!", "👍 Good - Mostly helpful", "👎 Needs improvement", "❌ Not helpful at all"], 
+                    label="How was Terry's last response?",
+                    value=None
+                )
+            
+            feedback_text = gr.Textbox(
+                label="What could Terry do better? (optional)", 
+                placeholder="Suggestions, corrections, or additional information needed...",
+                lines=3
+            )
+            
+            with gr.Row():
+                feedback_submit = gr.Button("Submit Feedback 📤", variant="primary")
+                feedback_status = gr.Textbox(label="Status", interactive=False, visible=False)
+
+        # Wire up the interactions
+        submit_btn.click(
+            handle_message_submission, 
+            inputs=[msg, chatbot], 
+            outputs=[chatbot, msg, interests_display]
+        )
+        
+        msg.submit(
+            handle_message_submission, 
+            inputs=[msg, chatbot], 
+            outputs=[chatbot, msg, interests_display]
+        )
+        
+        clear_btn.click(
+            lambda: ([(None, get_welcome_message())], ""), 
+            outputs=[chatbot, msg]
+        )
+        
+        view_btn.click(get_chat_history, inputs=[chatbot], outputs=[history_output])
+        save_btn.click(save_history_to_file, inputs=[chatbot], outputs=[history_output])
+        
+        feedback_submit.click(
+            save_feedback,
+            inputs=[rating, feedback_text, chatbot],
+            outputs=[feedback_status, rating, feedback_text]
+        ).then(
+            lambda: gr.update(visible=True),
+            outputs=[feedback_status]
+        )
+
+        # Footer
+        gr.HTML("""
+            <div style="text-align: center; padding: 25px; margin-top: 20px; background: #f8f9fa; border-radius: 10px; border-top: 3px solid #DC143C;">
+                <div style="margin-bottom: 15px;">
+                    <h4 style="color: #DC143C; margin: 0;">🐢 University of Maryland</h4>
+                    <p style="color: #666; margin: 5px 0;">A. James Clark School of Engineering</p>
+                </div>
+                
+                <div style="margin-bottom: 15px;">
+                    <p style="color: #888; font-size: 14px; margin: 0;">
+                        <strong>Important:</strong> This AI advisor provides guidance based on publicly available information.
+                        Always verify details with official UMD sources and your academic advisor.
+                    </p>
+                </div>
+                
+                <div style="border-top: 1px solid #ddd; padding-top: 15px;">
+                    <p style="color: #666; font-size: 13px; margin: 0;">
+                        Questions or technical issues? Contact UMD IT Support | 
+                        <a href="https://eng.umd.edu" target="_blank" style="color: #DC143C;">Clark School Website</a> | 
+                        <a href="https://umd.edu" target="_blank" style="color: #DC143C;">UMD Main Site</a>
+                    </p>
+                </div>
+            </div>
+        """)
+
+    return interface
+
+#response = requests.post("https://api.mistral.ai/v1/chat/completions", headers=headers, json=payload)
+#print("Status Code:", response.status_code)
+#print("Response Text:", response.text)
+
+# Launch the application 
+if __name__ == "__main__":
+    interface = create_interface()
+    interface.launch(
+        server_name="0.0.0.0",
+        server_port=7886,
+        share=True,
+        debug=True,
+        auth=[("student1", "password123"), ("advisor", "umdrocks")]
+    )
